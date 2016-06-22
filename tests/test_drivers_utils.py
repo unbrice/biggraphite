@@ -15,6 +15,7 @@
 from __future__ import absolute_import
 from __future__ import print_function
 
+import math
 import unittest
 
 import mock
@@ -46,6 +47,41 @@ class CountDownTest(unittest.TestCase):
             self.on_zero.assert_not_called()
         self.count_down.on_cassandra_result(result)
         self.on_zero.assert_called_with(None)
+
+
+class FloatSharderTest(unittest.TestCase):
+
+    VALUES = range(10) + [
+        _utils.ShardedFloat.MIN_ABS*2,
+        0.001, 0.03,
+        0.0, 0.1, 0.5,
+        math.pi, 32.0,
+        2.0 ** 32, 2.0 ** 64,
+        _utils.ShardedFloat.MAX_ABS,
+    ]
+    VALUES = VALUES + [-v for v in VALUES]
+
+    def assertEqualWithMargin(self, v, vbis):
+        if v != 0:
+            margin_pct = abs(v-vbis)/abs(v) * 100
+        else:
+            margin_pct = abs(v) * 100
+        self.assertLess(margin_pct, 1, "%f became %f (%0.2f%% imprecision)" % (v, vbis, margin_pct))
+
+
+    def test_box_unbox(self):
+        for v in self.VALUES:
+            vbis = _utils.ShardedFloat.from_float(v).simplified.as_float
+            self.assertEqualWithMargin(v, vbis)
+
+    def test_add(self):
+        for v1 in self.VALUES:
+            v1_sharded =  _utils.ShardedFloat.from_float(v1).simplified
+            for v2 in self.VALUES:
+                v2_sharded =  _utils.ShardedFloat.from_float(v2).simplified
+                v = v1 + v2
+                vbis = v1_sharded.approx_add(v2_sharded).simplified.as_float
+                self.assertEqualWithMargin(v, vbis)
 
 
 if __name__ == "__main__":
