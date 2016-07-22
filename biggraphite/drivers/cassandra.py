@@ -88,8 +88,8 @@ _SETUP_CQL_PATH_INDEXES = [
 ]
 # TODO: Make row size proportional to the precision
 _ROW_SIZE_MS = 3600 * 1000
-_SETUP_CQL_DATAPOINTS = str(
-    "CREATE TABLE IF NOT EXISTS datapoints ("
+_SETUP_CQL_DATAPOINTS_TEMPLATE = str(
+    "CREATE TABLE IF NOT EXISTS datapoints_%(duration_h)dh ("
     "  metric text,"              # Metric name.
     # TODO: Remove time_step
     "  time_step_ms int,"         # Time step (AKA granularity, resolution).
@@ -102,8 +102,8 @@ _SETUP_CQL_DATAPOINTS = str(
     "  WITH CLUSTERING ORDER BY (time_offset_ms DESC)"
     "  AND compaction={"
     "    'timestamp_resolution': 'MICROSECONDS',"
-    "    'max_sstable_age_days': '1',"
-    "    'base_time_seconds': '900',"
+    "    'max_sstable_age_days': '1',"  # TODO: Tweak with duration
+    "    'base_time_seconds': '3600',"  # TODO: Tweak with duration
     "    'class': 'DateTieredCompactionStrategy'"
     "  };"
 )
@@ -112,6 +112,61 @@ _SETUP_CQL = [
     _SETUP_CQL_METRICS,
     _SETUP_CQL_DIRECTORIES,
 ] + _SETUP_CQL_PATH_INDEXES
+
+
+class _DataTablesManager(object):
+
+    _MICROSECONDS_PER_SECOND = 1000 * 1000
+    
+    def __init__(self, stage):
+        self._duration_to_insert = {}
+        self._duration_to_select = {}
+        self._session = session
+
+    def _create_datapoints_table(self, stage):
+        # Idempotent.
+        self._session.execute(
+            _SETUP_CQL_DATAPOINTS_TEMPLATE % {"duration_h": self._duration_hours(stage)}
+        )
+
+    @staticmethod
+    def _duration_hours(stage):
+        return (stage.duration + 3599) // 3600
+
+    def prepare_insert(self, stage):
+        hours = self._duration_hours(stage)
+        microseconds = stage.duration * self._MICROSECONDS_PER_SECOND
+        statement = self._duration_to_insert.get(hours)
+        if statement:
+            return statement
+        statement_str = (
+            "INSERT INTO datapoints_%(duration_h)d"
+            " (metric, time_step_ms, time_start_ms, time_offset_ms, value, count)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            # One week TODO: this is a stopgap until we implement table-based TTLs
+            " USING TTL %(duration_mus)d;"
+        )  % {"duration_h": hours, "duration_mus": microseconds}
+        statement = self._session.prepare(statement_str)
+        statement.consistency_level = cassandra.ConsistencyLevel.ANY
+        self._duration_to_insert[hours] = statement
+        return statement
+
+    def prepare_select(self, stage):
+        hours = self._duration_hours(stage)
+        statement = self._duration_to_select.get(hours)
+        if statement:
+            return statement
+        self._create_datapoints_table(stage)
+        statement_str = (
+            "SELECT time_start_ms, time_offset_ms, value, count FROM datapoints_%(duration_h)d"
+            " WHERE metric=? AND time_step_ms=? AND time_start_ms=?"
+            " AND time_offset_ms >= ? AND time_offset_ms < ? "
+            " ORDER BY time_offset_ms;"
+        ) % {"duration_h": hours}
+        statement = self._session.prepare(statement_str)
+        statement.consistency_level = cassandra.ConsistencyLevel.LOCAL_ONE
+        self._duration_to_select[hours] = statement
+        return statement
 
 
 class _CassandraAccessor(bg_accessor.Accessor):
@@ -152,9 +207,7 @@ class _CassandraAccessor(bg_accessor.Accessor):
         self.__cluster = None  # setup by connect()
         self.__default_timeout = default_timeout
         self.__insert_metrics_statement = None  # setup by connect()
-        self.__insert_statement = None  # setup by connect()
         self.__select_metric_statement = None  # setup by connect()
-        self.__select_statement = None  # setup by connect()
         self.__session = None  # setup by connect()
 
     def connect(self, skip_schema_upgrade=False):
@@ -171,19 +224,6 @@ class _CassandraAccessor(bg_accessor.Accessor):
             self.__session.default_timeout = self.__default_timeout
         if not skip_schema_upgrade:
             self._upgrade_schema()
-        self.__insert_statement = self.__session.prepare(
-            "INSERT INTO datapoints "
-            "(metric, time_step_ms, time_start_ms, time_offset_ms, value, count)"
-            " VALUES (?, ?, ?, ?, ?, ?)"
-            # One week TODO: this is a stopgap until we implement table-based TTLs
-            " USING TTL 604800;"
-        )
-        self.__insert_statement.consistency_level = cassandra.ConsistencyLevel.ONE
-        self.__select_statement = self.__session.prepare(
-            "SELECT time_start_ms, time_offset_ms, value, count FROM datapoints"
-            " WHERE metric=? AND time_step_ms=? AND time_start_ms=?"
-            " AND time_offset_ms >= ? AND time_offset_ms < ? "
-            " ORDER BY time_offset_ms;")
         components_names = ", ".join("component_%d" % n for n in range(_COMPONENTS_MAX_LEN))
         components_marks = ", ".join("?" for n in range(_COMPONENTS_MAX_LEN))
         self.__insert_metrics_statement = self.__session.prepare(

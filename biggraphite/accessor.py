@@ -44,6 +44,8 @@ _UTF8_CODEC = codecs.getencoder('utf8')
 
 _NAN = float("nan")
 
+_SECONDS_PER_DAY = 86400
+
 
 def encode_metric_name(name):
     """Encode name as utf-8, raise UnicodeError if it can't.
@@ -253,14 +255,35 @@ class Stage(object):
         return hash((self.points, self.precision))
 
     @property
+    def approximate_duration_days(self):
+        """Return duration in days, rounded up to a greater power of 2."""
+        days = round_up(self.duration, _SECONDS_PER_DAY) // _SECONDS_PER_DAY
+        next_power_of_2 = int(2 ** math.ceil(math.log(days, 2)))
+        if next_power_of_2 < 4:
+            return 4
+        return next_power_of_2
+
+    def approximate_expiry_day(self, timestamp):
+        # Round up so that all points of a given epoch expire on the same day.
+        rounded_timestamp = round_up(timestamp, self.precision)
+        timestamp_day = rounded_timestamp // _SECONDS_PER_DAY
+        return round_up(timestamp_day, self.approximate_duration_days)
+
+    @property
     def as_string(self):
         """A string like "${POINTS}*${PRECISION}s"."""
         return "{}*{}s".format(self.points, self.precision)
 
-    @property
-    def precision_ms(self):
-        """The duration of this stage in microseconds."""
-        return self.precision * 1000
+    def epoch(self, timestamp):
+        """Return time elapsed since Unix epoch in count of self.duration.
+
+        A "stage epoch" is a range of timestamps: [N*stage_duration, (N+1)*stage_duration[
+        This function returns N.
+
+        Args:
+          timestamp: A timestamp in seconds.
+        """
+        return int(timestamp // self.duration)
 
     @classmethod
     def from_string(cls, s):
@@ -274,16 +297,10 @@ class Stage(object):
             precision=int(groups['precision']),
         )
 
-    def epoch(self, timestamp):
-        """Return time elapsed since Unix epoch in count of self.duration.
-
-        A "stage epoch" is a range of timestamps: [N*stage_duration, (N+1)*stage_duration[
-        This function returns N.
-
-        Args:
-          timestamp: A timestamp in seconds.
-        """
-        return int(timestamp // self.duration)
+    @property
+    def precision_ms(self):
+        """The duration of this stage in microseconds."""
+        return self.precision * 1000
 
     def round_down(self, timestamp):
         """Round down a timestamp to a multiple of the precision."""
